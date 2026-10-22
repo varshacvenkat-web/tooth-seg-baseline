@@ -1,0 +1,9 @@
+data/
+runs/
+predictions/
+*.pt
+*.zip
+kaggle.json
+access_token
+.ipynb_checkpoints/
+__pycache__/
