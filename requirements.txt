@@ -1,3 +1,13 @@
-ultralytics>=8.3.0
-opencv-python-headless>=4.8
-numpy>=1.24
+# Pinned versions the results were produced with (Colab, Python 3.13).
+# torch/torchvision are NOT pinned here: use the CUDA build your machine or Colab provides
+# (results were produced with torch 2.11.0+cu130). reproduce.sh records the full environment
+# of every run in results/environment.txt.
+ultralytics==8.4.190
+opencv-python-headless>=4.10
+numpy>=1.26
+scipy>=1.11
+shapely==2.2.0
+matplotlib>=3.8
+PyYAML>=6.0
+pytest==9.2.0
+kaggle>=1.6

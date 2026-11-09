@@ -1,5 +1,9 @@
+# data, training runs and smoke tests stay out of git (runs/weights live on Drive)
 data/
 runs/
+smoke_data/
+smoke_runs/
+smoke_results/
 predictions/
 *.pt
 *.zip
@@ -7,3 +11,4 @@ kaggle.json
 access_token
 .ipynb_checkpoints/
 __pycache__/
+.pytest_cache/

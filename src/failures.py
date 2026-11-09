@@ -1,213 +1,231 @@
-"""Find the worst test images and save a failure gallery.
+"""Failure taxonomy on the TEST split: the 20 worst images, a visual catalog, and mAP impact.
 
-For every test image, each ground-truth tooth is compared with the
-predictions (mask IoU, computed at reduced resolution for speed):
-  ok            a prediction with the same tooth number overlaps it with IoU >= 0.5
-  missed        no prediction of any number overlaps it (IoU < 0.3)
-  wrong number  found (IoU >= 0.5) but labeled as another tooth; split into
-                mirror (same tooth, other side) and neighbor (adjacent tooth)
-  poor outline  everything else: the right area but a loose or partial mask
-Also flagged per image: merged (one prediction covering 30%+ of two or more
-teeth), teeth touching the image edge, and extra predictions matching nothing.
+Every true tooth that is not matched (same number, mask IoU >= 0.5) gets ONE primary category,
+checked in this order (cause-specific first; src/imgeval.py: categorize):
+  edge clipping            the tooth touches the edge of the X-ray's field of view
+  metallic / restoration   >= 15% of the tooth is metal-bright (fillings, crowns, implants, brackets)
+  merged neighbours        one predicted mask covers >= 30% of this tooth and of a neighbour
+  missed                   no predicted mask of any number overlaps it (IoU < 0.3)
+  wrong number             found (IoU >= 0.5) but labelled as another tooth (mirror / neighbour / other)
+  poor boundary            the right area but a loose or partial mask
+False positives are counted too: phantom masks on bone, sinus or background ("other").
+The metal and edge flags are image heuristics: check them in the gallery and correct
+failures.csv (manual_notes) before reporting.
 
-Image score = mean IoU of each ground-truth tooth with its best same-number
-prediction (a missed tooth counts as 0). The 10 lowest scores are saved as
-overlays: green = ground-truth outline, colored fill = prediction, red box =
-a failed tooth with a tag (M missed, W wrong number, O poor outline, E edge).
-Crowns, implants and fillings can't be detected automatically: look at the
-gallery and add them in the manual_notes column of failures.csv.
+Impact: for each of the two most common categories, re-score the test set without the images
+that category dominates (>= 2 of its teeth and >= half the image's failures). The mAP gain is a
+rough estimate of what that failure costs (removing an image also removes its good teeth).
 
 Example:
-    python src/failures.py --weights runs/baseline_s0/weights/best.pt \
-        --data data/teeth_yolo --out results/failures
+    python src/failures.py --data data/teeth_yolo/data.yaml --data-root data/teeth_yolo \
+        --runs runs/baseline_s0/weights/best.pt runs/baseline_s1/weights/best.pt --out results/failures
 """
 import argparse
 import csv
+import statistics as st
 import sys
 from pathlib import Path
 
 import cv2
 import numpy as np
-from ultralytics import YOLO
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-from predict import predict_image, tooth_number  # noqa: E402
+from src.common import VAL_CONF, read_names, seed_of, subset_yaml, train_imgsz  # noqa: E402
+from src.evaluate import evaluate  # noqa: E402
+from src.analyze import locked  # noqa: E402
+from src.imgeval import label_for, run_image, split_images  # noqa: E402
 
-WORK_SIDE = 1024  # rasterize masks at this longest side for speed
-
-
-def mirror(n):
-    return 17 - n if n <= 16 else 49 - n
-
-
-def neighbor(a, b):
-    return abs(a - b) == 1 and (a <= 16) == (b <= 16)
-
-
-def shape(polys, s, h, w):
-    """Rasterize polygons (pixel coords) at scale s; keep the crop box for fast IoU."""
-    m = np.zeros((int(h * s) + 2, int(w * s) + 2), np.uint8)
-    allp = []
-    for p in polys:
-        q = np.round(np.asarray(p, float) * s).astype(np.int32)
-        cv2.fillPoly(m, [q], 1)
-        allp.append(q)
-    q = np.concatenate(allp)
-    x0, y0 = q.min(0)
-    x1, y1 = q.max(0) + 1
-    box = (max(x0, 0), max(y0, 0), x1, y1)
-    return {"m": m, "box": box, "area": int(m.sum())}
+CATS = ["edge clipping", "metallic / restoration", "merged neighbours", "missed",
+        "wrong number (mirror)", "wrong number (neighbour)", "wrong number (other)", "poor boundary"]
+TAG = {"edge clipping": "E", "metallic / restoration": "Mt", "merged neighbours": "Mg", "missed": "Ms",
+       "wrong number (mirror)": "Wm", "wrong number (neighbour)": "Wn", "wrong number (other)": "Wo",
+       "poor boundary": "B", "phantom": "FP"}
+HEX = {"edge clipping": "#2a78d6", "metallic / restoration": "#eb6834", "merged neighbours": "#1baf7a",
+       "missed": "#eda100", "wrong number (mirror)": "#e87ba4", "wrong number (neighbour)": "#e87ba4",
+       "wrong number (other)": "#e87ba4", "poor boundary": "#6250d6", "phantom": "#e34948"}
+BGR = {k: tuple(int(v[i:i + 2], 16) for i in (5, 3, 1)) for k, v in HEX.items()}
 
 
-def inter(a, b):
-    x0, y0 = max(a["box"][0], b["box"][0]), max(a["box"][1], b["box"][1])
-    x1, y1 = min(a["box"][2], b["box"][2]), min(a["box"][3], b["box"][3])
-    if x1 <= x0 or y1 <= y0:
-        return 0
-    return int((a["m"][y0:y1, x0:x1] & b["m"][y0:y1, x0:x1]).sum())
+def outline(img, mask, color, t=2):
+    cnts, _ = cv2.findContours(mask.astype(np.uint8), cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    cv2.drawContours(img, cnts, -1, color, t)
 
 
-def iou(a, b):
-    i = inter(a, b)
-    u = a["area"] + b["area"] - i
-    return i / u if u else 0.0
-
-
-def load_gt(label_file, names, w, h):
-    gt = {}
-    for line in label_file.read_text().splitlines():
-        v = line.split()
-        if len(v) < 7:
-            continue
-        pts = np.array(v[1:], float).reshape(-1, 2) * [w, h]
-        gt.setdefault(tooth_number(names[int(v[0])]), []).append(pts)
-    return gt
-
-
-def analyze(img_path, label_file, model, conf):
-    img = cv2.imread(str(img_path))
-    h, w = img.shape[:2]
-    s = min(1.0, WORK_SIDE / max(h, w))
-    gt_polys = load_gt(label_file, model.names, w, h)
-    pred = predict_image(model, img_path, conf=conf)
-    G = {n: shape(p, s, h, w) for n, p in gt_polys.items()}
-    P = [(t, shape([t["polygon"]], s, h, w)) for t in pred["teeth"]]
-
-    teeth, scores = [], []
-    for n, g in G.items():
-        same = max((iou(g, ps) for t, ps in P if t["tooth"] == n), default=0.0)
-        best_any, best_n = 0.0, None
-        for t, ps in P:
-            v = iou(g, ps)
-            if v > best_any:
-                best_any, best_n = v, t["tooth"]
-        bx = g["box"]
-        edge = bool(bx[0] <= 0.01 * w * s or bx[2] >= 0.99 * w * s or bx[1] <= 0.01 * h * s or bx[3] >= 0.99 * h * s)
-        if same >= 0.5:
-            cat = "ok"
-        elif best_any < 0.3:
-            cat = "missed"
-        elif best_any >= 0.5 and best_n != n:
-            cat = "mirror" if best_n == mirror(n) else "neighbor" if neighbor(best_n, n) else "wrong number"
-        else:
-            cat = "poor outline"
-        teeth.append({"tooth": n, "iou": same, "cat": cat, "edge": edge, "pred_as": best_n})
-        scores.append(same)
-
-    merged = sum(1 for _, ps in P if sum(inter(g, ps) >= 0.3 * g["area"] for g in G.values()) >= 2)
-    extra = sum(1 for _, ps in P if max((iou(g, ps) for g in G.values()), default=0.0) < 0.3)
-    cats = [t["cat"] for t in teeth]
-    row = {
-        "image": img_path.name,
-        "score": round(float(np.mean(scores)) if scores else 0.0, 3),
-        "gt_teeth": len(G),
-        "pred_teeth": len(P),
-        "missed": cats.count("missed"),
-        "wrong_number": sum(c in ("mirror", "neighbor", "wrong number") for c in cats),
-        "mirror": cats.count("mirror"),
-        "neighbor": cats.count("neighbor"),
-        "poor_outline": cats.count("poor outline"),
-        "merged": merged,
-        "edge_teeth_failed": sum(t["edge"] and t["cat"] != "ok" for t in teeth),
-        "extra_predictions": extra,
-        "manual_notes": "",
-    }
-    return row, img, gt_polys, pred, teeth
-
-
-def draw(img, gt_polys, pred, teeth, row):
-    out = img.copy()
+def draw(r, k=2):
+    """Full-image overlay at k x the model frame so tags stay readable, with a colour key."""
+    up = lambda m: cv2.resize(m.astype(np.uint8), None, fx=k, fy=k, interpolation=cv2.INTER_NEAREST).astype(bool)  # noqa: E731
+    out = cv2.resize(r["lb"], None, fx=k, fy=k, interpolation=cv2.INTER_LINEAR)
+    gms, pms = [up(m) for m in r["gm"]], [up(m) for m in r["pm"]]
     rng = np.random.default_rng(0)
-    colors = {n: tuple(int(c) for c in rng.integers(60, 255, 3)) for n in range(33)}
-    fill = out.copy()
-    for t in pred["teeth"]:
-        cv2.fillPoly(fill, [np.round(t["polygon"]).astype(np.int32)], colors[t["tooth"]])
-    out = cv2.addWeighted(fill, 0.4, out, 0.6, 0)
-    k = max(img.shape[:2]) / 1500
-    for n, polys in gt_polys.items():
-        for p in polys:
-            cv2.polylines(out, [np.round(p).astype(np.int32)], True, (0, 220, 0), max(1, int(2 * k)))
-    tags = {"missed": "M", "mirror": "W", "neighbor": "W", "wrong number": "W", "poor outline": "O"}
-    for t in teeth:
-        if t["cat"] == "ok":
+    for m in pms:
+        out[m] = (0.6 * out[m] + 0.4 * rng.integers(60, 255, 3)).astype(np.uint8)
+    for m, g in zip(gms, r["gt"]):
+        outline(out, m, (0, 200, 0) if g["ok"] else BGR[g["category"]], 1 if g["ok"] else 3)
+    for m, g in zip(gms, r["gt"]):
+        if not g["ok"]:
+            ys, xs = np.nonzero(m)
+            cv2.putText(out, f"{g['tooth']}{TAG[g['category']]}", (int(xs.min()), max(int(ys.min()) - 4, 14)),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.55, BGR[g["category"]], 2)
+    for m, p in zip(pms, r["pred"]):
+        if p["kind"] == "phantom":
+            outline(out, m, BGR["phantom"], 3)
+    cv2.rectangle(out, (0, 0), (out.shape[1], 28), (0, 0, 0), -1)
+    cv2.putText(out, f"{r['image']}  per-image mean IoU {r['score']:.2f}   green outline = correct tooth", (8, 20),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 1)
+    items = []
+    for cat, tag in TAG.items():
+        if cat.startswith("wrong number (n") or cat.startswith("wrong number (o"):
             continue
-        q = np.concatenate([np.round(p).astype(np.int32) for p in gt_polys[t["tooth"]]])
-        x0, y0 = q.min(0)
-        x1, y1 = q.max(0)
-        cv2.rectangle(out, (int(x0), int(y0)), (int(x1), int(y1)), (0, 0, 255), max(1, int(2 * k)))
-        tag = f"{t['tooth']}{tags[t['cat']]}" + ("E" if t["edge"] else "")
-        if t["cat"] in ("mirror", "neighbor", "wrong number"):
-            tag += f"->{t['pred_as']}"
-        cv2.putText(out, tag, (int(x0), int(y0) - 6), cv2.FONT_HERSHEY_SIMPLEX, 0.7 * k, (0, 0, 255), max(1, int(2 * k)))
-    head = (f"{row['image']}  score {row['score']:.2f}  missed {row['missed']}  wrong# {row['wrong_number']}  "
-            f"outline {row['poor_outline']}  merged {row['merged']}  extra {row['extra_predictions']}")
-    cv2.rectangle(out, (0, 0), (out.shape[1], int(44 * k)), (0, 0, 0), -1)
-    cv2.putText(out, head, (int(10 * k), int(30 * k)), cv2.FONT_HERSHEY_SIMPLEX, 0.8 * k, (255, 255, 255), max(1, int(2 * k)))
-    return out
+        items.append((BGR[cat], {"wrong number (mirror)": "Wm/Wn/Wo = wrong number (mirror/neighbour/other)",
+                                 "phantom": "FP = false positive"}.get(cat, f"{tag} = {cat}")))
+    rows, x, y = [[]], 8, 0
+    for color, label in items:
+        w = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.42, 1)[0][0]
+        if x + w > out.shape[1] - 8 and rows[-1]:
+            rows.append([])
+            x = 8
+        rows[-1].append((x, color, label))
+        x += w + 14
+    key = np.zeros((24 * len(rows) + 6, out.shape[1], 3), np.uint8)
+    for r_i, row in enumerate(rows):
+        for x, color, label in row:
+            cv2.putText(key, label, (x, 20 + 24 * r_i), cv2.FONT_HERSHEY_SIMPLEX, 0.42, color, 1)
+    return np.vstack([out, key])
+
+
+def crop_pair(r, i, pad=24):
+    m = r["gm"][i]
+    ys, xs = np.nonzero(m)
+    S = m.shape[0]
+    y0, y1 = max(int(ys.min()) - pad, 0), min(int(ys.max()) + pad, S)
+    x0, x1 = max(int(xs.min()) - pad, 0), min(int(xs.max()) + pad, S)
+    gt = r["lb"].copy()
+    outline(gt, m, (0, 200, 0), 2)
+    pr = r["lb"].copy()
+    for pm in r["pm"]:
+        if (pm & m).any():
+            pr[pm] = (0.55 * pr[pm] + 0.45 * np.array([214, 120, 42])).astype(np.uint8)
+            outline(pr, pm, (214, 120, 42), 1)
+    a, b = gt[y0:y1, x0:x1], pr[y0:y1, x0:x1]
+    h = 220
+    a = cv2.resize(a, (max(1, int(a.shape[1] * h / a.shape[0])), h))
+    b = cv2.resize(b, (a.shape[1], h))
+    tile = np.hstack([a, np.full((h, 4, 3), 255, np.uint8), b])
+    label = f"{r['image']} tooth {r['gt'][i]['tooth']}: true (left) vs predicted (right)"
+    bar = np.zeros((20, tile.shape[1], 3), np.uint8)
+    cv2.putText(bar, label[:60], (4, 14), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255, 255, 255), 1)
+    return np.vstack([bar, tile])
+
+
+def grid(tiles, cols, width):
+    tiles = [cv2.resize(t, (width, int(t.shape[0] * width / t.shape[1]))) for t in tiles]
+    h = max(t.shape[0] for t in tiles)
+    tiles = [cv2.copyMakeBorder(t, 0, h - t.shape[0], 0, 0, cv2.BORDER_CONSTANT, value=(255, 255, 255)) for t in tiles]
+    while len(tiles) % cols:
+        tiles.append(np.full_like(tiles[0], 255))
+    return np.vstack([np.hstack(tiles[i:i + cols]) for i in range(0, len(tiles), cols)])
 
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--weights", required=True)
-    ap.add_argument("--data", required=True, help="YOLO dataset folder with images/test and labels/test")
+    ap.add_argument("--data", required=True)
+    ap.add_argument("--data-root", required=True)
+    ap.add_argument("--runs", nargs="+", required=True, help="baseline best.pt per seed; the first is analysed")
     ap.add_argument("--out", default="results/failures")
-    ap.add_argument("--worst", type=int, default=10)
-    ap.add_argument("--conf", type=float, default=0.25)
+    ap.add_argument("--worst", type=int, default=20)
     args = ap.parse_args()
 
-    data, out = Path(args.data), Path(args.out)
+    from ultralytics import YOLO
+    out = Path(args.out)
     out.mkdir(parents=True, exist_ok=True)
-    model = YOLO(args.weights)
-    imgs = sorted((data / "images" / "test").iterdir())
+    conf, iou = locked()
+    names = read_names(args.data)
+    w0 = args.runs[0]
+    model, imgsz = YOLO(w0), train_imgsz(w0)
+    images = split_images(args.data_root, "test")
 
-    results = []
-    for p in imgs:
-        row, img, gt_polys, pred, teeth = analyze(p, data / "labels" / "test" / f"{p.stem}.txt", model, args.conf)
-        results.append((row, img, gt_polys, pred, teeth))
-        print(f"{row['image']}: score {row['score']:.3f}")
+    recs = []
+    for p in images:
+        r = run_image(model, p, label_for(p), names, conf, iou, imgsz)
+        cats = [g["category"] for g in r["gt"] if not g["ok"]]
+        recs.append({"path": p, "image": r["image"], "score": r["score"], "gt": r["gt"], "pred": r["pred"],
+                     "cats": cats, "phantom": sum(x["kind"] == "phantom" for x in r["pred"]),
+                     "duplicate": sum(x["kind"] == "duplicate" for x in r["pred"])})
+    recs.sort(key=lambda r: r["score"])
+    worst = recs[: args.worst]
 
-    results.sort(key=lambda r: (r[0]["score"], -r[0]["extra_predictions"]))
-    with (out / "failures.csv").open("w", newline="") as f:
-        wr = csv.DictWriter(f, fieldnames=list(results[0][0]))
+    # ---- table per image and taxonomy counts
+    fields = ["rank", "image", "mean_iou", "true_teeth", "failed_teeth"] + CATS + ["false_pos_phantom", "duplicates",
+                                                                                     "dominant", "manual_notes"]
+    rows = []
+    for k, r in enumerate(worst, 1):
+        c = {cat: r["cats"].count(cat) for cat in CATS}
+        dom = max(CATS, key=lambda x: c[x]) if r["cats"] else ("false positives" if r["phantom"] else "none")
+        rows.append({"rank": k, "image": r["image"], "mean_iou": round(r["score"], 3), "true_teeth": len(r["gt"]),
+                     "failed_teeth": len(r["cats"]), **c, "false_pos_phantom": r["phantom"],
+                     "duplicates": r["duplicate"], "dominant": dom, "manual_notes": ""})
+    with (out / "failures_worst20.csv").open("w", newline="") as f:
+        wr = csv.DictWriter(f, fieldnames=fields)
         wr.writeheader()
-        wr.writerows(r[0] for r in results)
+        wr.writerows(rows)
 
-    thumbs = []
-    for rank, (row, img, gt_polys, pred, teeth) in enumerate(results[: args.worst], 1):
-        vis = draw(img, gt_polys, pred, teeth, row)
-        cv2.imwrite(str(out / f"worst_{rank:02d}_{Path(row['image']).stem}.jpg"), vis)
-        thumbs.append(cv2.resize(vis, (800, int(800 * vis.shape[0] / vis.shape[1]))))
-    th = max(t.shape[0] for t in thumbs)
-    thumbs = [cv2.copyMakeBorder(t, 0, th - t.shape[0], 0, 0, cv2.BORDER_CONSTANT) for t in thumbs]
-    while len(thumbs) % 2:
-        thumbs.append(np.zeros_like(thumbs[0]))
-    rows = [np.hstack(thumbs[i:i + 2]) for i in range(0, len(thumbs), 2)]
-    cv2.imwrite(str(out / "gallery.jpg"), np.vstack(rows))
+    def tally(rs):
+        t = {cat: sum(r["cats"].count(cat) for r in rs) for cat in CATS}
+        t["other: false positive (bone / sinus / background)"] = sum(r["phantom"] for r in rs)
+        return t
+    tw, ta = tally(worst), tally(recs)
+    imgs_w = {cat: sum(cat in r["cats"] for r in worst) for cat in CATS}
+    lines = [f"## Failure taxonomy: {len(worst)} worst test images (seed {seed_of(w0)}, conf {conf}, NMS IoU {iou})", "",
+             f"| Failure type | Teeth (worst {len(worst)}) | Images affected (worst {len(worst)}) | Teeth (all {len(recs)} test) |", "| --- | --- | --- | --- |"]
+    for cat in sorted(tw, key=lambda c: -tw[c]):
+        lines.append(f"| {cat} | {tw[cat]} | {imgs_w.get(cat, sum(r['phantom'] > 0 for r in worst))} | {ta[cat]} |")
+    lines += ["", "Metal and edge flags are heuristics: confirm in gallery_worst20.jpg and note corrections in "
+              "failures_worst20.csv (manual_notes)."]
 
-    totals = {k: sum(r[0][k] for r in results[: args.worst]) for k in
-              ("missed", "mirror", "neighbor", "wrong_number", "poor_outline", "merged", "edge_teeth_failed", "extra_predictions")}
-    print(f"\nWorst {args.worst} images, failure counts: {totals}")
-    print(f"Saved failures.csv, gallery.jpg and worst_*.jpg to {out.resolve()}")
+    # ---- visuals: re-run the worst images to draw them
+    tiles, crops = [], {cat: [] for cat in CATS}
+    for k, r0 in enumerate(worst, 1):
+        r = run_image(model, r0["path"], label_for(r0["path"]), names, conf, iou, imgsz)
+        vis = draw(r)
+        cv2.imwrite(str(out / f"worst_{k:02d}_{Path(r['image']).stem}.jpg"), vis)
+        tiles.append(vis)
+        for i, g in enumerate(r["gt"]):
+            if not g["ok"] and g["area"] > 0 and len(crops[g["category"]]) < 4:
+                crops[g["category"]].append(crop_pair(r, i))
+    cv2.imwrite(str(out / "gallery_worst20.jpg"), grid(tiles, 4, 640))
+    top = sorted(CATS, key=lambda c: -tw[c])
+    for cat in top[:4]:
+        if crops[cat]:
+            cv2.imwrite(str(out / f"catalog_{cat.split(' ')[0].replace('/', '')}.jpg"), grid(crops[cat], 2, 520))
+
+    # ---- impact estimate for the two most common categories (all test images)
+    top2 = [c for c in sorted(CATS, key=lambda c: -ta[c]) if ta[c] > 0][:2]
+    lines += ["", f"## Estimated mAP impact of the top two failure types", "",
+              "| Failure type | Images removed | mAP@50:95 all test | mAP@50:95 without them | Gain | Share of total mAP loss |",
+              "| --- | --- | --- | --- | --- | --- |"]
+    base = {w: float(evaluate(w, args.data, "test", VAL_CONF, iou).seg.map) for w in args.runs}
+    for cat in top2:
+        dom = [r["path"] for r in recs if r["cats"].count(cat) >= 2 and r["cats"].count(cat) >= len(r["cats"]) / 2]
+        if not dom or len(dom) == len(recs):
+            lines.append(f"| {cat} | {len(dom)} | | | | not estimable (no image dominated by it) |")
+            continue
+        keep = [r["path"] for r in recs if r["path"] not in dom]
+        y = subset_yaml(args.data, keep, out / f"subset_without_{TAG[cat]}.yaml")
+        gains, shares, b_all, b_wo = [], [], [], []
+        for w in args.runs:
+            v = float(evaluate(w, y, "test", VAL_CONF, iou).seg.map)
+            b_all.append(base[w])
+            b_wo.append(v)
+            gains.append(v - base[w])
+            shares.append((v - base[w]) / (1 - base[w]))
+        sd = lambda v: st.stdev(v) if len(v) > 1 else 0.0  # noqa: E731
+        lines.append(f"| {cat} | {len(dom)} of {len(recs)} | {st.mean(b_all):.3f} | {st.mean(b_wo):.3f} | "
+                     f"{st.mean(gains):+.3f} ± {sd(gains):.3f} | {100 * st.mean(shares):.0f}% |")
+    lines += ["", "Gain = mAP without those images minus mAP on all test images (mean ± SD over seeds); share = gain / "
+              "(1 - mAP). Rough: removing an image also removes its correctly segmented teeth."]
+    (out / "failures.md").write_text("\n".join(lines) + "\n")
+    print("\n".join(lines))
+    print(f"Saved to {out.resolve()}")
 
 
 if __name__ == "__main__":

@@ -1,0 +1,9 @@
+# Experiment 1: pre-registration. Fill this in AFTER the failure analysis (results/failures/failures.md),
+# share it with the team, and only then set signed_off: true. reproduce.sh refuses to train until then.
+name: exp1
+hypothesis: ""        # e.g. "Higher input resolution reduces poor-boundary and missed small-tooth failures"
+change: {}            # exactly ONE setting, e.g. {imgsz: 1024} or {fliplr: 0.0} or {hsv_v: 0.6}
+expected: ""          # metric + failure count you expect to move, e.g. "mask mAP@50:95 up by more than the baseline seed SD; poor-boundary teeth in the worst 20 down"
+reject_if: ""         # e.g. "mean mAP@50:95 gain <= baseline seed SD, or poor-boundary count unchanged"
+seeds: [0, 1, 2]      # same seeds as the baseline (paired)
+signed_off: false
