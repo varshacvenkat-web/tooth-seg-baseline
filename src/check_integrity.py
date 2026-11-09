@@ -4,8 +4,11 @@ Leakage: the dataset export has no patient IDs, so patient-level grouping is imp
 verify directly. As the closest check we confirm that
   1. no file name appears in more than one split,
   2. no byte-identical image appears in more than one split (MD5),
-  3. no near-duplicate image (64-bit difference hash, Hamming distance <= 4) crosses splits,
-     which would catch the same radiograph re-exported or slightly re-cropped.
+  3. no near-duplicate image crosses splits. Two stages, because every panoramic X-ray shares the
+     same overall layout and a coarse fingerprint alone flags many different patients:
+       a. candidates: 64-bit difference hash, Hamming distance <= 6
+       b. confirmed:  pixel correlation >= 0.95 between the two images at 256 x 128
+     The closest candidate pairs are saved side by side (near_duplicates.jpg) to check by eye.
 Config audit: reads each run's args.yaml and states input resolution, normalization, NMS,
 optimizer, epochs and which split chose the checkpoint (it must be val, never test).
 
@@ -37,7 +40,7 @@ def dhash(path, size=8) -> int:
     return int("".join("1" if b else "0" for b in bits), 2)
 
 
-def check_splits(root):
+def check_splits(root, out_dir=None):
     files = {s: sorted((Path(root) / "images" / s).iterdir()) for s in SPLITS}
     L, ok = [], True
     names = {s: {p.name for p in v} for s, v in files.items()}
@@ -54,14 +57,40 @@ def check_splits(root):
     ok &= not cross
     L.append(f"- Byte-identical images across splits: {len(cross)}" + (f" {cross[:3]}" if cross else ""))
     L.append(f"- Byte-identical images within one split (no leakage, noted): {len(within)}")
-    hashes = [(s, p.name, dhash(p)) for s, v in files.items() for p in v]
-    near = []
-    for (s1, n1, h1), (s2, n2, h2) in itertools.combinations(hashes, 2):
-        if s1 != s2 and bin(h1 ^ h2).count("1") <= 4:
-            near.append((s1, n1, s2, n2, bin(h1 ^ h2).count("1")))
-    L.append(f"- Near-duplicate pairs across splits (dHash Hamming <= 4): {len(near)}")
-    for n in near[:10]:
-        L.append(f"    - {n[0]}/{n[1]} ~ {n[2]}/{n[3]} (distance {n[4]}): inspect by eye")
+    hashes = [(s, p, dhash(p)) for s, v in files.items() for p in v]
+    cand = [(s1, p1, s2, p2, bin(h1 ^ h2).count("1"))
+            for (s1, p1, h1), (s2, p2, h2) in itertools.combinations(hashes, 2)
+            if s1 != s2 and bin(h1 ^ h2).count("1") <= 6]
+    small = {}
+
+    def thumb(p):
+        if p not in small:
+            g = cv2.resize(cv2.imread(str(p), cv2.IMREAD_GRAYSCALE), (256, 128), interpolation=cv2.INTER_AREA)
+            g = g.astype(np.float32).ravel()
+            small[p] = (g - g.mean()) / (g.std() + 1e-6)
+        return small[p]
+
+    scored = sorted(((float(np.mean(thumb(a) * thumb(b))), s1, a, s2, b, d) for s1, a, s2, b, d in cand),
+                    key=lambda t: -t[0])
+    near = [t for t in scored if t[0] >= 0.95]
+    corr = [t[0] for t in scored]
+    L.append(f"- Near-duplicate candidates across splits (dHash Hamming <= 6): {len(cand)}"
+             + (f"; their pixel correlation ranges {min(corr):.2f} to {max(corr):.2f}, median {np.median(corr):.2f}" if corr else ""))
+    L.append(f"- Confirmed near-duplicates across splits (correlation >= 0.95): {len(near)}")
+    for c, s1, a, s2, b, d in near[:10]:
+        L.append(f"    - {s1}/{a.name} ~ {s2}/{b.name} (correlation {c:.3f})")
+    if out_dir is not None and scored:
+        tiles = []
+        for c, s1, a, s2, b, d in scored[:12]:
+            ia = cv2.resize(cv2.imread(str(a)), (480, 240))
+            ib = cv2.resize(cv2.imread(str(b)), (480, 240))
+            bar = np.zeros((22, 964, 3), np.uint8)
+            cv2.putText(bar, f"{s1}/{a.name}  vs  {s2}/{b.name}   correlation {c:.3f}", (6, 16),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
+            tiles.append(np.vstack([bar, np.hstack([ia, np.full((240, 4, 3), 255, np.uint8), ib])]))
+        cv2.imwrite(str(Path(out_dir) / "near_duplicates.jpg"), np.vstack(tiles))
+        L.append("- The 12 closest candidate pairs are in near_duplicates.jpg: same patient = same teeth, "
+                 "fillings and gaps; different patients only share the general layout.")
     counts = ", ".join(f"{s} {len(v)}" for s, v in files.items())
     return ok and not near, L, counts, near
 
@@ -86,7 +115,8 @@ def main():
     ap.add_argument("--out", default="results/integrity.md")
     args = ap.parse_args()
 
-    ok, lines, counts, near = check_splits(args.data_root)
+    Path(args.out).parent.mkdir(parents=True, exist_ok=True)
+    ok, lines, counts, near = check_splits(args.data_root, Path(args.out).parent)
     L = ["## Split integrity", "", f"Split sizes: {counts}.", ""] + lines + ["",
          ("**No leakage found**" if ok else "**Possible leakage: see above**") +
          " at the file and image level. The Kaggle export carries no patient identifiers, so images of the same "

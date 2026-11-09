@@ -104,6 +104,7 @@ EOF
     python src/train.py --data "$DATA" --seed "$s" --name "exp1_s$s" --set $CHANGE
   done
   python src/evaluate.py --data "$DATA" --split test --out "$RES/exp1_test.csv" --runs $(group_runs exp1 exp1)
+  python src/failures.py --data "$DATA" --data-root "$YOLO_DIR" --out "$RES/failures_exp1" --runs $(weights exp1)
   python src/compare.py --baseline "$RES/baseline_test.csv" --out "$RES/comparison.md" \
     --other "Tuned post-processing=$RES/tuned_test.csv" "Exp 1 ($CHANGE)=$RES/exp1_test.csv"
 }
