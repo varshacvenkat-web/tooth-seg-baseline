@@ -9,6 +9,12 @@ The split is 70/15/15 with a fixed seed, and the exact file lists are saved to
 splits.json. Pass --split-file to reuse a saved split (e.g. for the CLAHE copy),
 so two datasets are guaranteed to use the same train/val/test images.
 
+Pass --drop-duplicates results/duplicate_groups.json (written by check_integrity.py) to remove
+leaked re-exports: in each group of copies of one radiograph, the copies are kept only in the
+first split they appear in (train, then val, then test) and removed from the later splits. The
+training set never changes, so trained models stay valid; only evaluation sets shrink. The removed
+names are saved to dropped_duplicates.json.
+
 Example:
     python src/convert.py --src "data/Teeth Segmentation JSON" --out data/teeth_yolo
     python src/convert.py --src data/clahe_kaggle --out data/teeth_yolo_clahe \
@@ -60,6 +66,7 @@ def main():
     ap.add_argument("--out", required=True)
     ap.add_argument("--seed", type=int, default=42)
     ap.add_argument("--split-file", help="Reuse an existing splits.json instead of shuffling")
+    ap.add_argument("--drop-duplicates", help="duplicate_groups.json: remove leaked copies from val/test")
     ap.add_argument("--clahe", action="store_true", help="Apply CLAHE to images while copying")
     args = ap.parse_args()
 
@@ -81,6 +88,21 @@ def main():
         n = len(imgs)
         n_tr, n_va = int(0.7 * n), int(0.15 * n)
         splits = {"train": imgs[:n_tr], "val": imgs[n_tr:n_tr + n_va], "test": imgs[n_tr + n_va:]}
+
+    dropped = []
+    if args.drop_duplicates:
+        where = {p.name: k for k, v in splits.items() for p in v}
+        order = ["train", "val", "test"]
+        for group in json.loads(Path(args.drop_duplicates).read_text()):
+            present = [n for n in group if n in where]
+            if not present:
+                continue
+            keep = min(order.index(where[n]) for n in present)
+            dropped += [{"image": n, "split": where[n], "copy_of": [m for m in present if order.index(where[m]) == keep]}
+                        for n in present if order.index(where[n]) > keep]
+        gone = {d["image"] for d in dropped}
+        splits = {k: [p for p in v if p.name not in gone] for k, v in splits.items()}
+        print(f"dropped {len(dropped)} leaked copies:", ", ".join(f"{d['split']}/{d['image']}" for d in dropped))
 
     missing = resized = 0
     for split, files in splits.items():
@@ -105,6 +127,8 @@ def main():
             lines = mask_to_lines(mask, val2cls, w, h)
             (out / "labels" / split / f"{p.stem}.txt").write_text("\n".join(lines))
 
+    if args.drop_duplicates:
+        (out / "dropped_duplicates.json").write_text(json.dumps(dropped, indent=1))
     (out / "splits.json").write_text(json.dumps({k: [p.name for p in v] for k, v in splits.items()}, indent=1))
     yaml = f"path: {out.resolve()}\ntrain: images/train\nval: images/val\ntest: images/test\nnames:\n"
     yaml += "".join(f"  {i}: '{nm}'\n" for i, nm in enumerate(names))
