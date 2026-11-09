@@ -45,11 +45,21 @@ stage_data() {
     : "${KAGGLE_API_TOKEN:?Dataset missing and KAGGLE_API_TOKEN not set}"
     kaggle datasets download -d humansintheloop/teeth-segmentation-on-dental-x-ray-images -p "$DATA_DIR" --unzip -q
   fi
+  # Leaked re-exports (same radiograph in two splits, found by check_integrity.py) are removed from
+  # val/test; train is unchanged, so trained models stay valid. A dataset built before this
+  # existed is rebuilt once.
+  DROP=()
+  if [[ "${SMOKE:-0}" != "1" && -f configs/duplicate_groups.json ]]; then
+    DROP=(--drop-duplicates configs/duplicate_groups.json)
+    if [[ -f "$DATA" && ! -f "$YOLO_DIR/dropped_duplicates.json" ]]; then
+      echo "Rebuilding $YOLO_DIR without the leaked duplicates"; rm -rf "$YOLO_DIR"
+    fi
+  fi
   if [[ ! -f "$DATA" ]]; then
     if [[ -f splits.json && "${SMOKE:-0}" != "1" ]]; then
-      python src/convert.py --src "$RAW" --out "$YOLO_DIR" --split-file splits.json   # the committed split
+      python src/convert.py --src "$RAW" --out "$YOLO_DIR" --split-file splits.json "${DROP[@]}"   # the committed split
     else
-      python src/convert.py --src "$RAW" --out "$YOLO_DIR" --seed 42
+      python src/convert.py --src "$RAW" --out "$YOLO_DIR" --seed 42 "${DROP[@]}"
     fi
   fi
   if [[ "${SMOKE:-0}" != "1" && ! -f splits.json ]]; then
