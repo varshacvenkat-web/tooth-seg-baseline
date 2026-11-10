@@ -1,0 +1,16 @@
+{
+ "image": "results/demo/edge_cases/blank_no_teeth.png",
+ "width": 1850,
+ "height": 1024,
+ "num_teeth": 0,
+ "conf_thresh": 0.5,
+ "iou": 0.7,
+ "imgsz": 640,
+ "warnings": [
+  "no teeth found above the confidence threshold"
+ ],
+ "overlap_pixels_resolved": 0,
+ "dropped_small": 0,
+ "dropped_invalid_polygon": 0,
+ "teeth": []
+}

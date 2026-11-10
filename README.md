@@ -10,18 +10,73 @@ and a validated `predict.py`.
 
 ## Results
 
-_Filled in from `results/` after a full run._
+Week 4 baseline: YOLO11s-seg, 640 px, 50 epochs, seeds 0/1/2, **88-image test set** (3 test images
+removed because they were re-exports of train/val scans; see Data integrity below). All numbers are
+mean ± SD over the 3 seeds. Raw outputs are in [`results/`](results/).
 
 | Setup | Seeds | Mask mAP@50 (mean ± SD) | Mask mAP@50:95 (mean ± SD) |
 | --- | --- | --- | --- |
-| Baseline | 0, 1, 2 | | |
-| Tuned post-processing | 0, 1, 2 | | |
-| Experiment 1 | 0, 1, 2 | | |
+| Baseline | 0, 1, 2 | 0.9503 ± 0.0018 | 0.5942 ± 0.0038 |
+| Tuned post-processing | 0, 1, 2 | 0.9503 ± 0.0018 | 0.5942 ± 0.0038 |
+| Experiment 1 (`mosaic: 0.0`, pre-registered, pending sign-off) | 0, 1, 2 | | |
 
 *Tuned post-processing* = the same baseline weights evaluated with the NMS IoU locked on the validation
 set (`configs/postprocess.yaml`); mAP is computed over all confidences (0.001), and precision/recall at the
 locked confidence are in `results/analysis/per_image_and_pr.md`. All rows: same test split, same seeds,
-paired by seed; per-seed deltas, paired t-test, Wilcoxon and Cohen's d_z are in `results/comparison.md`.
+paired by seed; per-seed deltas, paired t-test, Wilcoxon and Cohen's d_z will be in `results/comparison.md`.
+
+**Threshold sweep (val).** 4 confidences × 4 NMS IoUs; locked NMS IoU 0.7 (the default) and confidence 0.5
+(val F1 0.887). Tuning changed nothing on test: an honest null result.
+[`results/sweep/sweep_val.md`](results/sweep/sweep_val.md), examples in `results/sweep/nms_example_*.jpg`.
+
+**Operating point (conf 0.5, test).** Precision 0.919 ± 0.008, recall 0.903 ± 0.010, F1 0.911 ± 0.004.
+Errors are mostly false negatives, and the largest cause is off-by-one tooth numbering.
+
+**By tooth type** ([`ap_by_type.md`](results/analysis/ap_by_type.md)). AP@50 is high for every type
+(0.94 to 0.96). Precise outlines are the hard part: AP@85 is 0.090 for incisors vs 0.339 for 1st/2nd
+molars. All teeth: AP@75 0.706, AP@85 0.185.
+
+![AP vs IoU threshold by tooth type](results/analysis/ap_vs_iou_by_type.png)
+
+**Per image** ([`per_image_and_pr.md`](results/analysis/per_image_and_pr.md)). Median mean-mask IoU 0.759;
+6 of 88 images below 0.5. Hardest: 355, 412, 9, 193, 128.
+
+![Per-image IoU histogram](results/analysis/per_image_iou_hist.png)
+
+**Failure taxonomy** ([`failures.md`](results/failures/failures.md)), seed 0, 20 worst test images:
+
+| Failure type | Teeth (worst 20) | Teeth (all 88) |
+| --- | --- | --- |
+| Wrong number, neighbour (off by one) | 70 | 123 |
+| Missed | 39 | 54 |
+| Poor boundary | 9 | 12 |
+| Merged neighbours | 6 | 9 |
+| False positive (bone / sinus / background) | 3 | 4 |
+| Metallic / restoration, edge clipping | 0 | 0 |
+
+Estimated mAP@50:95 impact: removing the images dominated by neighbour numbering errors gives +0.017 ± 0.001;
+missed teeth, +0.010 ± 0.001. Visual catalog: `results/failures/gallery_worst20.jpg`, `catalog_*.jpg`,
+`worst_*.jpg`.
+
+![Worst 20 test images](results/failures/gallery_worst20.jpg)
+
+**Robustness** ([`robustness.md`](results/robustness/robustness.md)), drop in mAP@50:95 vs clean:
+blur σ1.5 4%, blur σ3 20%, contrast 60% 1%, contrast 30% 4%, Gaussian noise σ10 78%, σ25 100%.
+The model tolerates blur and contrast changes but fails on noisy images.
+
+**Data integrity** ([`integrity.md`](results/integrity.md)). No shared file names or byte-identical
+images across splits. An all-pairs comparison after contrast equalisation found 3 radiographs exported
+twice (same burned-in date/time) with the copies in different splits: train/250 ~ test/249,
+train/26 ~ test/25, val/85 ~ test/86 (similarity 0.999 vs a 99.9th percentile of 0.83 across all
+pairs). The 3 test copies are excluded (`configs/duplicate_groups.json`); train and val are unchanged,
+so the trained models remain valid. Removing them lowered mAP@50 from 0.9524 to 0.9503. Patient-level
+grouping across visits is not possible (no patient IDs in the export).
+
+**predict.py demo** ([`demo.md`](results/demo/demo.md)). 10 unseen test images, all processed; masks
+at the original resolution; edge cases (blank, colour, RGBA, 16-bit, corrupted, 20 px, missing file)
+handled with a warning or a clear error. 33 unit tests pass (`results/pytest.txt`).
+
+![predict.py on 10 unseen test images](results/demo/demo_contact_sheet.jpg)
 
 ## Setup
 

@@ -1,0 +1,4 @@
+group,seed,weights,conf,iou,mask_mAP50,mask_mAP50_95,mask_P,mask_R,mask_F1
+baseline,0,/content/drive/MyDrive/tooth_seg/runs/baseline_s0/weights/best.pt,0.001,0.7,0.9512,0.592,0.9209,0.8893,0.9048
+baseline,1,/content/drive/MyDrive/tooth_seg/runs/baseline_s1/weights/best.pt,0.001,0.7,0.9514,0.5985,0.9158,0.9008,0.9082
+baseline,2,/content/drive/MyDrive/tooth_seg/runs/baseline_s2/weights/best.pt,0.001,0.7,0.9482,0.592,0.8901,0.9053,0.8976

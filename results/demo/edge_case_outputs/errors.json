@@ -1,0 +1,4 @@
+{
+ "corrupted.jpg": "Could not decode corrupted.jpg: the file is corrupted or not an image format OpenCV reads",
+ "tiny_20px.png": "tiny_20px.png: image is 20x20 px; at least 32 px per side is required"
+}

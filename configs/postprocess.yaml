@@ -1,0 +1,11 @@
+conf: 0.5
+iou: 0.7
+split: val
+seeds:
+- 0
+- 1
+- 2
+rule: iou = best mean val mask mAP50-95 at the lowest conf; conf = best mean val F1
+  at that iou
+val_mask_mAP50_95: 0.5741
+val_f1: 0.8872
